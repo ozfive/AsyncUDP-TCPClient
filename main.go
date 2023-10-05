@@ -2,81 +2,89 @@ package main
 
 import (
 	"bufio"
-	"fmt"
+	"encoding/gob"
+	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/inancgumus/screen"
 )
 
+type DiscoveryRequest struct {
+	Command string
+}
+
+type DiscoveryResponse struct {
+	Address string
+}
+
 const maxDatagramSize = 8192
 
 func main() {
+	// Handle termination signals gracefully
+	setupSignalHandler()
+
 	// Set up UDP client
-	ServerAddr, err := net.ResolveUDPAddr("udp", "255.255.255.255:10001")
+	serverAddr, err := net.ResolveUDPAddr("udp", "255.255.255.255:10001")
 	if err != nil {
-		fmt.Println("Error: ", err)
-		return
+		log.Fatalf("Error resolving UDP address: %v", err)
 	}
-	ClientAddr, err := net.ResolveUDPAddr("udp", ":10101")
+	clientAddr, err := net.ResolveUDPAddr("udp", ":10101")
 	if err != nil {
-		fmt.Println("Error: ", err)
-		return
+		log.Fatalf("Error resolving UDP address: %v", err)
 	}
 
-	Conn, err := net.ListenUDP("udp", ClientAddr)
+	conn, err := net.ListenUDP("udp", clientAddr)
 	if err != nil {
-		fmt.Println("Error: ", err)
-		return
+		log.Fatalf("Error listening: %v", err)
 	}
-	defer Conn.Close()
+	defer conn.Close()
 
-	DiscoveryMessage := "REQUEST"
-	buf := make([]byte, maxDatagramSize)
-	writeBuf := []byte(DiscoveryMessage)
-
-	// Send discovery message
-	_, err = Conn.WriteToUDP(writeBuf, ServerAddr)
-	if err != nil {
-		fmt.Println("Error: ", err)
-		return
+	// Create a DiscoveryRequest struct
+	discoveryRequest := DiscoveryRequest{
+		Command: "REQUEST",
 	}
-	fmt.Println("Discovery packet sent from", ClientAddr.String())
+
+	// Initialize encoder and decoder for structured communication
+	encoder := gob.NewEncoder(conn)
+	decoder := gob.NewDecoder(conn)
+
+	// Send discovery message as a structured request
+	if err := encoder.Encode(discoveryRequest); err != nil {
+		log.Fatalf("Error encoding discovery request: %v", err)
+	}
+	log.Printf("Discovery packet sent from %s", clientAddr.String())
 
 	// Wait for autodiscovery response
 	var tcpAddr *net.TCPAddr
 	for {
-		n, _, err := Conn.ReadFromUDP(buf)
+		var response DiscoveryResponse
+
+		// Receive the structured response
+		if err := decoder.Decode(&response); err != nil {
+			log.Fatalf("Error decoding discovery response: %v", err)
+		}
+		log.Printf("Received TCP server address: %s", response.Address)
+
+		tcpAddr, err = net.ResolveTCPAddr("tcp", response.Address)
 		if err != nil {
-			fmt.Println("Error: ", err)
-			continue
+			log.Fatalf("Error resolving TCP address: %v", err)
 		}
-		message := make([]byte, n)
-		copy(message, buf[:n])
-		fmt.Println("Received", string(message))
 
-		if strings.HasPrefix(string(message), "THE TCP SERVER IS LOCATED AT ") {
-			tcpAddrString := strings.TrimSpace(strings.TrimPrefix(string(message), "THE TCP SERVER IS LOCATED AT "))
-			tcpAddr, err = net.ResolveTCPAddr("tcp", tcpAddrString)
-			if err != nil {
-				fmt.Println("Error resolving TCP address:", err.Error())
-				return
-			}
-
-			fmt.Println("TCP address resolved:", tcpAddr.String())
-			break
-		}
+		log.Printf("TCP address resolved: %s", tcpAddr.String())
+		break
 	}
 
 	// Connect to TCP server
-	conn, err := net.DialTCP("tcp", nil, tcpAddr)
+	tcpConn, err := net.DialTCP("tcp", nil, tcpAddr)
 	if err != nil {
-		fmt.Println("Error connecting to TCP server:", err.Error())
-		return
+		log.Fatalf("Error connecting to TCP server: %v", err)
 	}
-	defer conn.Close()
-	fmt.Println("Connected to TCP server", tcpAddr.String())
+	defer tcpConn.Close()
+	log.Printf("Connected to TCP server %s", tcpAddr.String())
 
 	// Create channel for user input
 	inputCh := make(chan string)
@@ -85,19 +93,16 @@ func main() {
 	go readInput(inputCh)
 
 	// Start goroutine to send data to server
-	go sendDataToServer(conn, inputCh)
+	go sendDataToServer(tcpConn, inputCh)
 
 	// Start goroutine to receive data from server
-	go receiveDataFromServer(conn)
-
-	// Wait for goroutines to finish before exiting
-	select {}
+	go receiveDataFromServer(tcpConn)
 }
 
 func readInput(inputCh chan<- string) {
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		fmt.Print("Enter message to send: ")
+		log.Print("Enter message to send: ")
 		input, _ := reader.ReadString('\n')
 		if strings.TrimSpace(input) == "/clear" {
 			screen.Clear()
@@ -112,8 +117,7 @@ func sendDataToServer(conn net.Conn, inputCh <-chan string) {
 	for input := range inputCh { // Wait for user input from channel
 		_, err := conn.Write([]byte(input)) // Send input to server
 		if err != nil {
-			fmt.Println("Error sending data to server:", err.Error())
-			return
+			log.Fatalf("Error sending data to server: %v", err)
 		}
 	}
 }
@@ -123,12 +127,20 @@ func receiveDataFromServer(conn net.Conn) {
 	for {
 		data, err := reader.ReadString('\n') // Receive data from server
 		if err != nil {
-			fmt.Println("Error receiving data from server:", err.Error())
-			return
+			log.Fatalf("Error receiving data from server: %v", err)
 		}
-		fmt.Print("\033[2K") // Clear current line
-		fmt.Print("\033[G")  // Move cursor to beginning of line
-		fmt.Print("Received from server:", data)
-		fmt.Print("Enter message to send: ")
+		log.Printf("Received from server: %s", data)
+		log.Print("Enter message to send: ")
 	}
+}
+
+func setupSignalHandler() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-c
+		log.Println("\nReceived termination signal. Cleaning up resources...")
+		os.Exit(0)
+	}()
 }
